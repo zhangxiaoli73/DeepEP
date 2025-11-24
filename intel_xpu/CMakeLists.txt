@@ -113,7 +113,10 @@ else()
 endif()
 
 # SYCL flags
+# -fsycl enables SYCL compilation and should automatically link required libraries
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsycl")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsycl")
 
 # Optimization flags
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -161,6 +164,10 @@ set(HEADERS
 # Create Python extension module
 pybind11_add_module(_C ${SOURCES} ${HEADERS})
 
+# Define the module name for pybind11
+# This must match the name used in PYBIND11_MODULE() macro
+target_compile_definitions(_C PRIVATE MODULE_NAME=_C)
+
 # Set target properties
 set_target_properties(_C PROPERTIES
     CXX_STANDARD 17
@@ -168,9 +175,59 @@ set_target_properties(_C PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
+# Find SYCL runtime libraries (required for Intel XPU)
+# These are needed because we compile with -fsycl
+
+# Find Level Zero (runtime for Intel GPUs)
+find_library(LEVEL_ZERO_LIBRARY
+    NAMES ze_loader
+    PATHS /lib/x86_64-linux-gnu
+)
+
+if(LEVEL_ZERO_LIBRARY)
+    message(STATUS "Found Level Zero library: ${LEVEL_ZERO_LIBRARY}")
+else()
+    message(WARNING "Level Zero library not found.")
+endif()
 # Link libraries
 target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES})
 
+# Find torch_python library
+# Strategy:
+# 1. If user provides TORCH_LIB_DIR, use it
+# 2. Otherwise, query from conda/Python environment
+# 3. If not found, FATAL ERROR (don't continue with broken build)
+
+# Method 1: Check if user provided TORCH_LIB_DIR via command line
+# Usage: cmake .. -DTORCH_LIB_DIR=/path/to/torch/lib
+if(DEFINED TORCH_LIB_DIR)
+    if(EXISTS ${TORCH_LIB_DIR})
+        message(STATUS "PyTorch library directory (user-provided): ${TORCH_LIB_DIR}")
+    else()
+        message(FATAL_ERROR "User-provided TORCH_LIB_DIR does not exist: ${TORCH_LIB_DIR}")
+    endif()
+else()
+    # Method 2: Query from Python (conda environment or system Python)
+    message(FATAL_ERROR "Querying PyTorch library directory from Python environment...")
+endif()
+
+# Now search for torch_python in the library directory
+find_library(TORCH_PYTHON_LIBRARY
+    NAMES torch_python
+    PATHS ${TORCH_LIB_DIR}
+    NO_DEFAULT_PATH
+)
+
+if(TORCH_PYTHON_LIBRARY)
+    message(STATUS "✓ Found torch_python library: ${TORCH_PYTHON_LIBRARY}")
+    target_link_libraries(_C PRIVATE ${TORCH_PYTHON_LIBRARY})
+else()
+    # torch_python not found - this is a critical error
+    message(FATAL_ERROR "torch_python library not found in ${TORCH_LIB_DIR}")
+endif()
+if(LEVEL_ZERO_LIBRARY)
+    target_link_libraries(_C PRIVATE ${LEVEL_ZERO_LIBRARY})
+endif()
 # Link Intel SHMEM if found
 if(ISHMEM_FOUND)
     target_link_libraries(_C PRIVATE ${ISHMEM_LIBRARY})
@@ -178,10 +235,22 @@ if(ISHMEM_FOUND)
 endif()
 
 # Set output directory
+# For development builds, output directly to the package directory
+if(NOT DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+    set_target_properties(_C PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/deep_ep_xpu
+    )
+else()
+    set_target_properties(_C PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
+    )
+endif()
+
+# Set proper extension suffix - pybind11 handles this automatically
+# Just ensure we don't override it
 set_target_properties(_C PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/deep_ep_xpu
     PREFIX ""
-    SUFFIX "${Python3_SOABI}${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    OUTPUT_NAME "_C"
 )
 
 # Installation

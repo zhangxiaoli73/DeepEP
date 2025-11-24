@@ -158,7 +158,13 @@ private:
 
 }  // namespace deep_ep_xpu
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+// Module name must match the target name in CMakeLists.txt (which is "_C")
+// TORCH_EXTENSION_NAME is only defined when using torch.utils.cpp_extension
+#ifndef MODULE_NAME
+#define MODULE_NAME _C
+#endif
+
+PYBIND11_MODULE(MODULE_NAME, m) {
     m.doc() = "Intel XPU Low Latency MoE Communication Library";
     
     py::class_<deep_ep_xpu::BufferWrapper>(m, "Buffer")
