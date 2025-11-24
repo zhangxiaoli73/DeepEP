@@ -1,0 +1,14 @@
+# Intel XPU Deep EP Requirements
+
+# Core dependencies
+torch>=2.0.0
+intel-extension-for-pytorch>=2.0.0
+
+# Build dependencies
+cmake>=3.20
+pybind11>=2.10.0
+
+# Optional dependencies for testing
+pytest>=7.0.0
+numpy>=1.20.0
+
