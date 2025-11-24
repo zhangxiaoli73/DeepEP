@@ -340,6 +340,99 @@ internode_ll::dispatch(
 
 ---
 
+## 修复 8: Intel SHMEM API 不存在
+
+**错误信息**:
+```
+error: use of undeclared identifier 'ishmemx_int_p_work_group'
+   72 |     ishmemx_int_p_work_group(dst, value, dst_pe, g);
+```
+
+**原因**:
+Intel SHMEM 库没有 `ishmemx_int_p_work_group` 函数。这个函数是我们假设的 API，但实际上 Intel SHMEM 只有 `ishmem_int_p`（标准 API）。
+
+**修复**:
+
+使用 `ishmem_int_p` 并在 work group 中只让 leader 线程执行：
+
+```cpp
+// 之前（错误）
+template<typename Group>
+SYCL_EXTERNAL inline void ishmem_int_p_work_group(
+    Group& g, int* dst, int value, int dst_pe
+) {
+    ishmemx_int_p_work_group(dst, value, dst_pe, g);  // ❌ 不存在
+}
+
+// 现在（正确）
+template<typename Group>
+SYCL_EXTERNAL inline void ishmem_int_p_work_group(
+    Group& g, int* dst, int value, int dst_pe
+) {
+    // Only leader thread performs the operation
+    if (g.leader()) {
+        ishmem_int_p(dst, value, dst_pe);  // ✅ 使用标准 API
+    }
+    // Synchronize the group after the operation
+    sycl::group_barrier(g);
+}
+```
+
+**位置**: `intel_xpu/csrc/kernels/ishmem_utils.hpp:62-79`
+
+---
+
+## 修复 9: atomic_ref 默认内存顺序无效
+
+**错误信息**:
+```
+error: static assertion failed due to requirement 'detail::integral_constant<bool, false>::value':
+Invalid default memory_order for atomics. Valid defaults are: relaxed, acq_rel, seq_cst
+```
+
+**原因**:
+SYCL 的 `atomic_ref` 模板参数（默认内存顺序）只能是 `relaxed`、`acq_rel` 或 `seq_cst`，不能使用 `acquire` 或 `release`。
+
+**修复**:
+
+使用 `acq_rel` 作为默认顺序，然后在调用 `load()`/`store()` 时指定具体的内存顺序：
+
+```cpp
+// 之前（错误）
+template<typename T>
+SYCL_EXTERNAL inline T atomic_load_acquire(T* ptr) {
+    sycl::atomic_ref<T, sycl::memory_order::acquire,  // ❌ 不能作为默认顺序
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> atomic_ptr(*ptr);
+    return atomic_ptr.load();
+}
+
+// 现在（正确）
+template<typename T>
+SYCL_EXTERNAL inline T atomic_load_acquire(T* ptr) {
+    sycl::atomic_ref<T, sycl::memory_order::acq_rel,  // ✅ 使用 acq_rel 作为默认
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> atomic_ptr(*ptr);
+    return atomic_ptr.load(sycl::memory_order::acquire);  // ✅ 指定具体顺序
+}
+```
+
+**修复的函数**:
+- `atomic_load_acquire` - 使用 `acq_rel` 默认 + `acquire` 参数
+- `atomic_store_release` - 使用 `acq_rel` 默认 + `release` 参数
+- `atomic_add_release` - 使用 `acq_rel` 默认 + `release` 参数
+- `atomic_exchange` - 使用 `acq_rel` 默认 + `acq_rel` 参数
+
+**位置**: `intel_xpu/csrc/kernels/utils.hpp:31-66`
+
+**说明**:
+- SYCL `atomic_ref` 的第一个模板参数是**默认内存顺序**
+- 默认顺序只能是 `relaxed`、`acq_rel` 或 `seq_cst`
+- 可以在调用 `load()`、`store()` 等方法时传递更具体的内存顺序参数
+- `acquire` 和 `release` 只能作为方法参数，不能作为模板参数
+
+---
+
 ## SYCL API 参考
 
 ### nd_item 常用方法

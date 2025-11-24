@@ -68,8 +68,14 @@ SYCL_EXTERNAL inline void ishmem_int_p_work_group(
     int value,
     int dst_pe
 ) {
-    // Use ishmemx_int_p_work_group for device-initiated put
-    ishmemx_int_p_work_group(dst, value, dst_pe, g);
+    // Intel SHMEM: use ishmem_int_p (standard API, not work_group variant)
+    // The work_group parameter is for synchronization context
+    // Note: Only one thread in the group should call this
+    if (g.leader()) {
+        ishmem_int_p(dst, value, dst_pe);
+    }
+    // Synchronize the group after the operation
+    sycl::group_barrier(g);
 }
 
 // Quiet operation - wait for all outstanding operations to complete

@@ -30,21 +30,23 @@ SYCL_EXTERNAL inline uint16_t float_to_bf16_bits(float x) {
 
 // Atomic operations with memory ordering
 // Port of: ld_acquire_global, st_release_global, atomic_add_release_global from CUDA
+// Note: SYCL atomic_ref only allows relaxed, acq_rel, or seq_cst as default order
+// We use acq_rel and then call load/store with specific memory order
 
 template<typename T>
 SYCL_EXTERNAL inline T atomic_load_acquire(T* ptr) {
-    sycl::atomic_ref<T, sycl::memory_order::acquire,
+    sycl::atomic_ref<T, sycl::memory_order::acq_rel,
                      sycl::memory_scope::device,
                      sycl::access::address_space::global_space> atomic_ptr(*ptr);
-    return atomic_ptr.load();
+    return atomic_ptr.load(sycl::memory_order::acquire);
 }
 
 template<typename T>
 SYCL_EXTERNAL inline void atomic_store_release(T* ptr, T value) {
-    sycl::atomic_ref<T, sycl::memory_order::release,
+    sycl::atomic_ref<T, sycl::memory_order::acq_rel,
                      sycl::memory_scope::device,
                      sycl::access::address_space::global_space> atomic_ptr(*ptr);
-    atomic_ptr.store(value);
+    atomic_ptr.store(value, sycl::memory_order::release);
 }
 
 template<typename T>
@@ -52,7 +54,7 @@ SYCL_EXTERNAL inline T atomic_add_release(T* ptr, T value) {
     sycl::atomic_ref<T, sycl::memory_order::acq_rel,
                      sycl::memory_scope::device,
                      sycl::access::address_space::global_space> atomic_ptr(*ptr);
-    return atomic_ptr.fetch_add(value);
+    return atomic_ptr.fetch_add(value, sycl::memory_order::release);
 }
 
 template<typename T>
@@ -60,7 +62,7 @@ SYCL_EXTERNAL inline T atomic_exchange(T* ptr, T value) {
     sycl::atomic_ref<T, sycl::memory_order::acq_rel,
                      sycl::memory_scope::device,
                      sycl::access::address_space::global_space> atomic_ptr(*ptr);
-    return atomic_ptr.exchange(value);
+    return atomic_ptr.exchange(value, sycl::memory_order::acq_rel);
 }
 
 // FP8 E4M3 conversion (simplified)
