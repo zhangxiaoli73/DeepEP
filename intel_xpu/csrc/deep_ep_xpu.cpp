@@ -266,6 +266,7 @@ Buffer::low_latency_combine(
     void* combined_x = out.has_value() ? out.value() :
                        sycl::malloc_device(num_combined_tokens * hidden * sizeof(uint16_t), queue_);
 
+    std::cout << "[low_latency_combine] start to call internode combine \n" << std::endl;
     // Call combine kernel
     internode_ll::combine(
         queue_,
@@ -295,6 +296,8 @@ Buffer::low_latency_combine(
         internode_ll::LOW_LATENCY_SEND_PHASE | internode_ll::LOW_LATENCY_RECV_PHASE,
         zero_copy
     );
+
+    std::cout << "[low_latency_combine] finish internode combine \n" << std::endl;
 
     // Create hook for async receive
     std::function<void()> hook = [this]() {

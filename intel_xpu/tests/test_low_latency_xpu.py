@@ -13,7 +13,6 @@ import sys
 sys.path.insert(0, '..')
 
 import deep_ep_xpu
-from deep_ep_xpu.buffer import create_buffer, low_latency_dispatch_wrapper, low_latency_combine_wrapper
 from deep_ep_xpu.utils import init_xpu_distributed, calc_diff, hash_tensor, per_token_cast_to_fp8, per_token_cast_back
 
 from utils import init_dist
@@ -33,39 +32,41 @@ def test_low_latency_dispatch_combine(
     seed: int = 0
 ):
     """Test low latency dispatch and combine operations"""
-    
+
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
-    
+
     assert num_experts % num_ranks == 0
     num_local_experts = num_experts // num_ranks
-    
+
     print(f"[Rank {rank}] Testing with num_tokens={num_tokens}, hidden={hidden}, "
           f"num_experts={num_experts}, num_topk={num_topk}, use_fp8={use_fp8}")
-    
+
     # Create test data
     hidden_states = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device='xpu')
-    topk_idx = torch.randint(0, num_experts, (num_tokens, num_topk), dtype=torch.int32, device='xpu')
+    topk_idx = torch.randint(0, num_experts, (num_tokens, num_topk), dtype=torch.int64, device='xpu')
     topk_weights = torch.randn(num_tokens, num_topk, dtype=torch.float32, device='xpu')
-    
+
     # Normalize weights
     if use_logfmt:
         topk_weights = torch.log_softmax(topk_weights, dim=-1)
     else:
         topk_weights = torch.softmax(topk_weights, dim=-1)
-    
+
     # Test dispatch
     print(f"[Rank {rank}] Testing dispatch...")
-    recv_hidden_states, recv_count, handle, event, hook = low_latency_dispatch_wrapper(
-        buffer, hidden_states, topk_idx, num_tokens, num_experts,
+    recv_hidden_states, recv_count, handle, event, hook = buffer.low_latency_dispatch(
+        hidden_states, topk_idx, num_tokens, num_experts,
         use_fp8=use_fp8, async_finish=False, return_recv_hook=True
     )
-    
+
     if hook is not None:
         hook()  # Wait for completion
-    
+
+    event.wait()  # Wait for event
+
     print(f"[Rank {rank}] Dispatch completed. Received counts: {recv_count}")
-    
+
     # Simulate expert processing
     if isinstance(recv_hidden_states, tuple):
         recv_x, recv_scales = recv_hidden_states
@@ -73,33 +74,35 @@ def test_low_latency_dispatch_combine(
         expert_output = per_token_cast_back(recv_x, recv_scales)
     else:
         expert_output = recv_hidden_states
-    
+
     # Simple expert processing (identity for testing)
     expert_output = expert_output.clone()
-    
+
     # Test combine
     print(f"[Rank {rank}] Testing combine...")
-    combined_output, event, hook = low_latency_combine_wrapper(
-        buffer, expert_output, topk_idx, topk_weights, handle,
+    combined_output, event, hook = buffer.low_latency_combine(
+        expert_output, topk_idx, topk_weights, handle,
         use_logfmt=use_logfmt, async_finish=False, return_recv_hook=True
     )
-    
+
     if hook is not None:
         hook()  # Wait for completion
-    
+
+    event.wait()  # Wait for event
+
     print(f"[Rank {rank}] Combine completed. Output shape: {combined_output.shape}")
-    
+
     # Verify output shape
     assert combined_output.shape == (num_tokens, hidden), \
         f"Output shape mismatch: {combined_output.shape} vs {(num_tokens, hidden)}"
-    
+
     # Compute hash for verification across ranks
     output_hash = hash_tensor(combined_output)
     print(f"[Rank {rank}] Output hash: {output_hash}")
-    
+
     # Synchronize
     dist.barrier(group)
-    
+
     return output_hash
 
 
@@ -114,29 +117,33 @@ def test_correctness(
     buffer: deep_ep_xpu.Buffer
 ):
     """Test correctness with reference implementation"""
-    
+
     print(f"[Rank {rank}] Running correctness test...")
-    
+
     torch.manual_seed(42 + rank)
-    
+
     # Create test data
     hidden_states = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device='xpu')
-    topk_idx = torch.randint(0, num_experts, (num_tokens, num_topk), dtype=torch.int32, device='xpu')
+    topk_idx = torch.randint(0, num_experts, (num_tokens, num_topk), dtype=torch.int64, device='xpu')
     topk_weights = torch.softmax(torch.randn(num_tokens, num_topk, device='xpu'), dim=-1)
-    
+
     # Run low latency version
-    recv_hidden_states, recv_count, handle, event, hook = low_latency_dispatch_wrapper(
-        buffer, hidden_states, topk_idx, num_tokens, num_experts,
+    recv_hidden_states, recv_count, handle, event, hook = buffer.low_latency_dispatch(
+        hidden_states, topk_idx, num_tokens, num_experts,
         use_fp8=False, async_finish=False, return_recv_hook=False
     )
-    
+
+    event.wait()  # Wait for dispatch to complete
+
     expert_output = recv_hidden_states.clone()
-    
-    combined_output, event, hook = low_latency_combine_wrapper(
-        buffer, expert_output, topk_idx, topk_weights, handle,
+
+    combined_output, event, hook = buffer.low_latency_combine(
+        expert_output, topk_idx, topk_weights, handle,
         use_logfmt=False, async_finish=False, return_recv_hook=False
     )
-    
+
+    event.wait()  # Wait for combine to complete
+
     # Simple reference: weighted sum of inputs (simplified)
     # In real test, would implement full reference
     reference_output = torch.zeros_like(hidden_states)
@@ -144,14 +151,14 @@ def test_correctness(
         for k in range(num_topk):
             weight = topk_weights[i, k]
             reference_output[i] += weight * hidden_states[i]
-    
+
     # Compare (allowing for numerical differences)
     diff = calc_diff(combined_output, reference_output)
     print(f"[Rank {rank}] Difference from reference: {diff:.6f}")
-    
+
     # Relaxed threshold due to distributed operations
     assert diff < 0.1, f"Output differs too much from reference: {diff}"
-    
+
     print(f"[Rank {rank}] Correctness test passed!")
 
     dist.barrier(group)
@@ -171,19 +178,19 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_max_dispatch_tokens, args.hidden, num_ranks, args.num_experts
     )
 
-    if local_rank == 0:
-        print(f'Allocating buffer size: {rdma_buffer_size / 1e6} MB ...', flush=True)
-
-    buffer = create_buffer(
-        group,
-        buffer_size=int(2e9),
-        rdma_buffer_size=rdma_buffer_size,
+    buffer = deep_ep_xpu.Buffer(
+        group=group,
+        num_nvl_bytes=0,  # Not used on Intel XPU
+        num_rdma_bytes=rdma_buffer_size,
         low_latency_mode=True,
         num_qps_per_rank=max(24, args.num_experts // num_ranks),
         explicitly_destroy=True
     )
 
     print(f"[Rank {rank}] Buffer created with RDMA size: {rdma_buffer_size / 1e9:.2f} GB")
+
+    # Clean buffer before first use
+    buffer.clean_low_latency_buffer(num_max_dispatch_tokens, args.hidden, args.num_experts)
 
     # Run tests
     test_configs = [

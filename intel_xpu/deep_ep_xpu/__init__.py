@@ -10,7 +10,7 @@ import torch
 # Import the C++ extension
 try:
     from . import _C
-    Buffer = _C.Buffer
+    from .buffer import Buffer
 except ImportError as e:
     print(f"Warning: Failed to import C++ extension: {e}")
     print("Please build the extension first using: python setup.py install")
