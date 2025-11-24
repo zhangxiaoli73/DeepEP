@@ -56,7 +56,11 @@ SYCL_EXTERNAL inline void ishmem_atomic_add_nonfetch_work_group(
     int dst_pe
 ) {
     // Use ishmemx_int_atomic_add_work_group for device-initiated atomic add
-    ishmemx_int_atomic_add_work_group(dst, value, dst_pe, g);
+    //ishmemx_int_atomic_add_work_group(dst, value, dst_pe, g);
+    if (g.leader()) {
+        ishmem_int_atomic_add(dst, value, dst_pe);  // ✅ 标准 API
+    }
+    sycl::group_barrier(g);
 }
 
 // Remote put operation (single value) for work group

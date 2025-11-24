@@ -7,6 +7,7 @@ import random
 import torch
 import torch.distributed as dist
 from typing import Literal, Set
+import os
 
 import sys
 sys.path.insert(0, '..')
@@ -14,6 +15,8 @@ sys.path.insert(0, '..')
 import deep_ep_xpu
 from deep_ep_xpu.buffer import create_buffer, low_latency_dispatch_wrapper, low_latency_combine_wrapper
 from deep_ep_xpu.utils import init_xpu_distributed, calc_diff, hash_tensor, per_token_cast_to_fp8, per_token_cast_back
+
+from utils import init_dist
 
 
 def test_low_latency_dispatch_combine(
@@ -154,11 +157,11 @@ def test_correctness(
     dist.barrier(group)
 
 
-def test_main(args: argparse.Namespace, local_rank: int, num_local_ranks: int):
+def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     """Main test function"""
 
     # Initialize distributed
-    rank, num_ranks, group = init_xpu_distributed(local_rank, num_local_ranks)
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
     print(f"[Rank {rank}/{num_ranks}] Initialized on device {torch.xpu.current_device()}")
 
@@ -167,6 +170,9 @@ def test_main(args: argparse.Namespace, local_rank: int, num_local_ranks: int):
     rdma_buffer_size = deep_ep_xpu.Buffer.get_low_latency_rdma_size_hint(
         num_max_dispatch_tokens, args.hidden, num_ranks, args.num_experts
     )
+
+    if local_rank == 0:
+        print(f'Allocating buffer size: {rdma_buffer_size / 1e6} MB ...', flush=True)
 
     buffer = create_buffer(
         group,
@@ -217,16 +223,15 @@ def test_main(args: argparse.Namespace, local_rank: int, num_local_ranks: int):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Test Intel XPU low latency MoE kernels')
+    parser = argparse.ArgumentParser(description='Test low-latency EP kernels')
+    parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
     parser.add_argument('--num-devices', type=int, default=2, help='Number of XPU devices (default: 2)')
-    parser.add_argument('--num-tokens', type=int, default=16, help='Number of tokens (default: 16)')
-    parser.add_argument('--hidden', type=int, default=5120, help='Hidden dimension (default: 5120)')
-    parser.add_argument('--num-experts', type=int, default=256, help='Number of experts (default: 256)')
-    parser.add_argument('--num-topk', type=int, default=9, help='Top-K value (default: 9)')
-    parser.add_argument('--local-rank', type=int, default=0, help='Local rank (set by launcher)')
-
+    parser.add_argument('--num-tokens', type=int, default=128, help='Number of tokens (default: 128)')
+    parser.add_argument('--hidden', type=int, default=7168, help='Hidden dimension size (default: 7168)')
+    parser.add_argument('--num-topk', type=int, default=8, help='Number of top-k experts (default: 8)')
+    parser.add_argument('--num-experts', type=int, default=288, help='Number of experts (default: 288)')
     args = parser.parse_args()
 
-    # Run test
-    test_main(args, args.local_rank, args.num_devices)
+    num_processes = args.num_processes
+    torch.multiprocessing.spawn(test_main, args=(num_processes, args), nprocs=num_processes)
 

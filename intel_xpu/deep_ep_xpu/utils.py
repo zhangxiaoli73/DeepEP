@@ -6,7 +6,7 @@ import torch
 import intel_extension_for_pytorch as ipex
 
 
-def init_xpu_distributed(local_rank: int, num_local_ranks: int, backend: str = 'ccl'):
+def init_xpu_distributed(local_rank: int, num_local_ranks: int, backend: str = 'xccl'):
     """
     Initialize distributed training for Intel XPU
     
@@ -35,7 +35,7 @@ def init_xpu_distributed(local_rank: int, num_local_ranks: int, backend: str = '
     group = dist.new_group(list(range(world_size)))
     
     # Set default device and dtype
-    torch.set_default_device('xpu')
+    torch.set_default_device('xpu:' + str(rank))
     torch.set_default_dtype(torch.bfloat16)
     
     return rank, world_size, group

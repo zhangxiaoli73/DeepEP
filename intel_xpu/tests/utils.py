@@ -1,54 +1,35 @@
 """
 Utility functions for testing Intel XPU MoE operations
 """
-
+import inspect
 import torch
 import torch.distributed as dist
 import intel_extension_for_pytorch as ipex
 
 
-def init_dist(local_rank: int, num_local_ranks: int, backend: str = 'ccl'):
-    """
-    Initialize distributed process group for Intel XPU
-    
-    Args:
-        local_rank: Local rank ID
-        num_local_ranks: Number of local ranks
-        backend: Backend ('ccl' for Intel)
-    
-    Returns:
-        Tuple of (rank, world_size, process_group)
-    """
-    import os
-    
-    # Set device
-    torch.xpu.set_device(local_rank)
-    
-    # Initialize process group
-    if not dist.is_initialized():
-        # Set environment variables if not set
-        if 'RANK' not in os.environ:
-            os.environ['RANK'] = str(local_rank)
-        if 'WORLD_SIZE' not in os.environ:
-            os.environ['WORLD_SIZE'] = str(num_local_ranks)
-        if 'MASTER_ADDR' not in os.environ:
-            os.environ['MASTER_ADDR'] = 'localhost'
-        if 'MASTER_PORT' not in os.environ:
-            os.environ['MASTER_PORT'] = '29500'
-        
-        dist.init_process_group(backend=backend)
-    
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    
-    # Set defaults
+def init_dist(local_rank: int, num_local_ranks: int, backend: str = 'xccl'):
+    # NOTES: you may rewrite this function with your own cluster settings
+    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
+    port = int(os.getenv('MASTER_PORT', '8361'))
+    num_nodes = int(os.getenv('WORLD_SIZE', 1))
+    node_rank = int(os.getenv('RANK', 0))
+
+    sig = inspect.signature(dist.init_process_group)
+    params = {
+        'backend': 'xccl',
+        'init_method': f'tcp://{ip}:{port}',
+        'world_size': num_nodes * num_local_ranks,
+        'rank': node_rank * num_local_ranks + local_rank,
+    }
+    if 'device_id' in sig.parameters:
+        # noinspection PyTypeChecker
+        params['device_id'] = torch.device(f'xpu:{local_rank}')
+    dist.init_process_group(**params)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('xpu')
-    
-    # Create process group
-    group = dist.new_group(list(range(world_size)))
-    
-    return rank, world_size, group
+    torch.xpu.set_device(local_rank)
+
+    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
