@@ -19,16 +19,17 @@ using EventHandle = sycl::event;
 class Buffer {
 public:
     // Constructor
-    Buffer(void* process_group,           // Distributed process group (from PyTorch)
+    Buffer(int rank,                       // Rank in the distributed group
+           int num_ranks,                  // Total number of ranks
            size_t buffer_size,             // Main buffer size
            size_t rdma_buffer_size,        // RDMA buffer size
            bool low_latency_mode = false,  // Enable low latency mode
            int num_qps_per_rank = 1,       // Number of queue pairs per rank
            bool explicitly_destroy = false);
-    
+
     // Destructor
     ~Buffer();
-    
+
     // Disable copy
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
@@ -96,12 +97,11 @@ public:
 private:
     // SYCL queue
     sycl::queue queue_;
-    
+
     // Distributed info
     int rank_;
     int num_ranks_;
-    void* process_group_;
-    
+
     // Buffers
     void* main_buffer_ = nullptr;
     void* rdma_buffer_ = nullptr;

@@ -1,42 +1,57 @@
 #include "deep_ep_xpu.hpp"
 #include "kernels/internode_ll.hpp"
+#include <ATen/xpu/XPUEvent.h>
+#include <c10/core/StreamGuard.h>
+
 #include <iostream>
 #include <stdexcept>
 
+#define NUM_MAX_NVL_PEERS 8
+#define NUM_MAX_RDMA_PEERS 20
+#define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
+#define NUM_MAX_LOCAL_EXPERTS 1024
+#define NUM_BUFFER_ALIGNMENT_BYTES 128
+
+#define FINISHED_SUM_TAG 1024
+#define NUM_WAIT_NANOSECONDS 500
+
 namespace deep_ep_xpu {
 
-Buffer::Buffer(void* process_group,
+Buffer::Buffer(int rank,
+               int num_ranks,
                size_t buffer_size,
                size_t rdma_buffer_size,
                bool low_latency_mode,
                int num_qps_per_rank,
                bool explicitly_destroy)
-    : process_group_(process_group),
+    : rank_(rank),
+      num_ranks_(num_ranks),
       buffer_size_(buffer_size),
       rdma_buffer_size_(rdma_buffer_size),
       low_latency_mode_(low_latency_mode),
       num_qps_per_rank_(num_qps_per_rank),
       explicitly_destroy_(explicitly_destroy) {
-    
-    // Get default SYCL queue for Intel XPU
-    try {
-        queue_ = sycl::queue(sycl::gpu_selector_v);
-    } catch (const sycl::exception& e) {
-        std::cerr << "Failed to create SYCL queue: " << e.what() << std::endl;
-        throw;
-    }
-    
+
+       // Metadata memory
+    int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
+    int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
+    int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int*);
+
+    // Get ranks
+    auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    auto num_rdma_ranks = std::max(1, num_ranks / NUM_MAX_NVL_PEERS)
+    auto num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
+
+     auto torch_stream = at::xpu::getCurrentXPUStream();
+     auto queue_ = torch_stream.queue();
+
     // Get device info
     auto device = queue_.get_device();
     num_device_compute_units_ = device.get_info<sycl::info::device::max_compute_units>();
     
     std::cout << "Intel XPU Device: " << device.get_info<sycl::info::device::name>() << std::endl;
     std::cout << "Compute Units: " << num_device_compute_units_ << std::endl;
-    
-    // Initialize distributed info (simplified - would integrate with PyTorch distributed)
-    rank_ = 0;  // Would get from process_group
-    num_ranks_ = 1;  // Would get from process_group
-    
+
     // Allocate buffers
     initialize_buffers();
     
@@ -170,9 +185,9 @@ Buffer::low_latency_dispatch(
     }
 
     // Get buffer layout
-    int hidden = 5120;  // Would be passed as parameter
-    int num_tokens = 16;  // Would be passed as parameter
-    int num_topk = 9;  // Would be passed as parameter
+    auto num_tokens = static_cast<int>(x.size(0))
+    auto hidden = static_cast<int>(x.size(1));
+    auto num_topk = static_cast<int>(topk_idx.size(1));
 
     LowLatencyLayout layout(rdma_buffer_, num_max_dispatch_tokens_per_rank, hidden, num_ranks_, num_experts);
     auto& buffer = layout.buffers[low_latency_buffer_idx_];

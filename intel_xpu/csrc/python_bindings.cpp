@@ -11,15 +11,15 @@ namespace deep_ep_xpu {
 // Wrapper class for Python bindings
 class BufferWrapper {
 public:
-    BufferWrapper(py::object process_group,
+    BufferWrapper(int rank,
+                 int num_ranks,
                  size_t buffer_size,
                  size_t rdma_buffer_size,
                  bool low_latency_mode = false,
                  int num_qps_per_rank = 1,
                  bool explicitly_destroy = false) {
-        // Convert Python process group to void*
-        void* pg_ptr = process_group.ptr();
-        buffer_ = std::make_unique<Buffer>(pg_ptr, buffer_size, rdma_buffer_size,
+        // Create C++ Buffer with rank and num_ranks
+        buffer_ = std::make_unique<Buffer>(rank, num_ranks, buffer_size, rdma_buffer_size,
                                           low_latency_mode, num_qps_per_rank, explicitly_destroy);
     }
     
@@ -156,20 +156,18 @@ private:
     std::unique_ptr<Buffer> buffer_;
 };
 
-}  // namespace deep_ep_xpu
-
-// Module name must match the target name in CMakeLists.txt (which is "_C")
-// TORCH_EXTENSION_NAME is only defined when using torch.utils.cpp_extension
+}  // namespace deep_ep_
 #ifndef MODULE_NAME
 #define MODULE_NAME _C
 #endif
 
 PYBIND11_MODULE(MODULE_NAME, m) {
     m.doc() = "Intel XPU Low Latency MoE Communication Library";
-    
+
     py::class_<deep_ep_xpu::BufferWrapper>(m, "Buffer")
-        .def(py::init<py::object, size_t, size_t, bool, int, bool>(),
-             py::arg("process_group"),
+        .def(py::init<int, int, size_t, size_t, bool, int, bool>(),
+             py::arg("rank"),
+             py::arg("num_ranks"),
              py::arg("buffer_size"),
              py::arg("rdma_buffer_size"),
              py::arg("low_latency_mode") = false,

@@ -71,8 +71,11 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
 
         # Create C++ Buffer instance
+        # C++ constructor signature: (rank, num_ranks, buffer_size, rdma_buffer_size, low_latency_mode, num_qps_per_rank, explicitly_destroy)
+        # Note: buffer_size is for general buffer (not used on Intel XPU), rdma_buffer_size is for RDMA
+        buffer_size = num_nvl_bytes if num_nvl_bytes > 0 else num_rdma_bytes  # Use rdma_buffer_size if nvl_bytes is 0
         self.runtime = deep_ep_xpu_cpp.Buffer(
-            group, num_nvl_bytes, num_rdma_bytes,
+            self.rank, self.group_size, buffer_size, num_rdma_bytes,
             low_latency_mode, num_qps_per_rank, explicitly_destroy)
 
         # Intel SHMEM configuration for low-latency mode
