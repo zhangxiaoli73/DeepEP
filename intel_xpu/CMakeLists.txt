@@ -61,11 +61,10 @@ if(NOT pybind11_FOUND)
 endif()
 
 # Find Intel SHMEM (optional)
-set(ISHMEM_FOUND FALSE)
 if(USE_ISHMEM)
-    set(ISHMEM_HOME $ENV{ISHMEM_HOME})
-    if(NOT ISHMEM_HOME)
-        message(STATUS "ISHMEM_HOME not set. Trying default locations...")
+    # Set ISHMEM root directory
+    set(ISHMEM_ROOT_DIR $ENV{ISHMEM_ROOT})
+    if(NOT ISHMEM_ROOT_DIR)
         # Try common installation paths
         set(ISHMEM_SEARCH_PATHS
             "/opt/intel/ishmem"
@@ -74,42 +73,32 @@ if(USE_ISHMEM)
         )
         foreach(path ${ISHMEM_SEARCH_PATHS})
             if(EXISTS ${path})
-                set(ISHMEM_HOME ${path})
+                set(ISHMEM_ROOT_DIR ${path})
                 message(STATUS "Found Intel SHMEM at: ${path}")
                 break()
             endif()
         endforeach()
     endif()
 
-    if(ISHMEM_HOME)
-        find_library(ISHMEM_LIBRARY
-            NAMES ishmem
-            PATHS ${ISHMEM_HOME}/lib ${ISHMEM_HOME}/lib64
-            NO_DEFAULT_PATH
-        )
-
-        find_path(ISHMEM_INCLUDE_DIR
-            NAMES ishmem.h
-            PATHS ${ISHMEM_HOME}/include
-            NO_DEFAULT_PATH
-        )
-
-        if(ISHMEM_LIBRARY AND ISHMEM_INCLUDE_DIR)
-            set(ISHMEM_FOUND TRUE)
-            message(STATUS "Found Intel SHMEM library: ${ISHMEM_LIBRARY}")
-            message(STATUS "Found Intel SHMEM include: ${ISHMEM_INCLUDE_DIR}")
+    if(ISHMEM_ROOT_DIR)
+        # Use find_package with ISHMEMConfig.cmake
+        find_package(ISHMEM REQUIRED HINTS ${ISHMEM_ROOT_DIR}/lib/cmake/ishmem)
+        
+        if(ISHMEM_FOUND)
+            message(STATUS "Found Intel SHMEM via CMake config")
+            message(STATUS "  ISHMEM_ROOT: ${ISHMEM_ROOT}")
+            message(STATUS "  ISHMEM_INCLUDE: ${ISHMEM_INCLUDE}")
+            message(STATUS "  ISHMEM_LIBRARY: ${ISHMEM_LIBRARY}")
             add_compile_definitions(USE_ISHMEM)
-        else()
-            message(WARNING "Intel SHMEM not found at ${ISHMEM_HOME}")
-            message(WARNING "Multi-node communication will be disabled.")
-            message(WARNING "To enable, install Intel SHMEM and set ISHMEM_HOME environment variable.")
         endif()
     else()
         message(WARNING "Intel SHMEM not found. Multi-node communication will be disabled.")
-        message(WARNING "To enable, install Intel SHMEM and set ISHMEM_HOME environment variable.")
+        message(WARNING "To enable, install Intel SHMEM and set ISHMEM_ROOT environment variable.")
+        set(ISHMEM_FOUND FALSE)
     endif()
 else()
     message(STATUS "Intel SHMEM support disabled (USE_ISHMEM=OFF)")
+    set(ISHMEM_FOUND FALSE)
 endif()
 
 # SYCL flags
@@ -142,7 +131,7 @@ include_directories(
 
 # Add Intel SHMEM include directory if found
 if(ISHMEM_FOUND)
-    include_directories(${ISHMEM_INCLUDE_DIR})
+    include_directories(${ISHMEM_INCLUDE})
 endif()
 
 # Source files
@@ -192,26 +181,22 @@ endif()
 # Link libraries
 target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES})
 
-# Find torch_python library
-# Strategy:
-# 1. If user provides TORCH_LIB_DIR, use it
-# 2. Otherwise, query from conda/Python environment
-# 3. If not found, FATAL ERROR (don't continue with broken build)
+# Find torch_python library - critical for pybind11 tensor conversion
+# Query PyTorch library directory from Python
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import torch; import os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
+    OUTPUT_VARIABLE TORCH_LIB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE TORCH_LIB_RESULT
+)
 
-# Method 1: Check if user provided TORCH_LIB_DIR via command line
-# Usage: cmake .. -DTORCH_LIB_DIR=/path/to/torch/lib
-if(DEFINED TORCH_LIB_DIR)
-    if(EXISTS ${TORCH_LIB_DIR})
-        message(STATUS "PyTorch library directory (user-provided): ${TORCH_LIB_DIR}")
-    else()
-        message(FATAL_ERROR "User-provided TORCH_LIB_DIR does not exist: ${TORCH_LIB_DIR}")
-    endif()
-else()
-    # Method 2: Query from Python (conda environment or system Python)
-    message(FATAL_ERROR "Querying PyTorch library directory from Python environment...")
+if(NOT TORCH_LIB_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to query PyTorch library directory from Python")
 endif()
 
-# Now search for torch_python in the library directory
+message(STATUS "PyTorch library directory: ${TORCH_LIB_DIR}")
+
+# Search for torch_python library
 find_library(TORCH_PYTHON_LIBRARY
     NAMES torch_python
     PATHS ${TORCH_LIB_DIR}
@@ -219,18 +204,17 @@ find_library(TORCH_PYTHON_LIBRARY
 )
 
 if(TORCH_PYTHON_LIBRARY)
-    message(STATUS "✓ Found torch_python library: ${TORCH_PYTHON_LIBRARY}")
+    message(STATUS "Found torch_python library: ${TORCH_PYTHON_LIBRARY}")
     target_link_libraries(_C PRIVATE ${TORCH_PYTHON_LIBRARY})
 else()
-    # torch_python not found - this is a critical error
-    message(FATAL_ERROR "torch_python library not found in ${TORCH_LIB_DIR}")
+    message(FATAL_ERROR "torch_python library not found in ${TORCH_LIB_DIR}. This is required for pybind11 tensor conversion.")
 endif()
 if(LEVEL_ZERO_LIBRARY)
     target_link_libraries(_C PRIVATE ${LEVEL_ZERO_LIBRARY})
 endif()
 # Link Intel SHMEM if found
 if(ISHMEM_FOUND)
-    target_link_libraries(_C PRIVATE ${ISHMEM_LIBRARY})
+    target_link_libraries(_C PRIVATE ISHMEM::ISHMEM)
     target_compile_definitions(_C PRIVATE USE_ISHMEM)
 endif()
 

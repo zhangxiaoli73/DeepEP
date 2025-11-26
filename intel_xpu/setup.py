@@ -29,11 +29,23 @@ class CMakeBuild(build_ext):
     def build_extension(self, ext):
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
         
+        # Force use of Intel SYCL compiler
+        import shutil
+        icpx_path = shutil.which('icpx')
+        if not icpx_path:
+            raise RuntimeError(
+                "Intel SYCL compiler (icpx) not found. "
+                "Please source Intel oneAPI environment:\n"
+                "  source /opt/intel/oneapi/setvars.sh"
+            )
+        
         # CMake configuration arguments
         cmake_args = [
+            f'-DCMAKE_CXX_COMPILER={icpx_path}',
             f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}',
             f'-DPYTHON_EXECUTABLE={sys.executable}',
             '-DCMAKE_BUILD_TYPE=Release',
+            '-DUSE_ISHMEM=ON',
         ]
         
         # Build arguments
@@ -75,7 +87,6 @@ setup(
     cmdclass={'build_ext': CMakeBuild},
     install_requires=[
         'torch>=2.0.0',
-        'intel-extension-for-pytorch>=2.0.0',
     ],
     python_requires='>=3.8',
     classifiers=[

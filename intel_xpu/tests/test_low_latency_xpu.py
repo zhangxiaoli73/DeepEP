@@ -9,8 +9,8 @@ import torch.distributed as dist
 from typing import Literal, Set
 import os
 
-import sys
-sys.path.insert(0, '..')
+# import sys
+# sys.path.insert(0, '..')
 
 import deep_ep_xpu
 from deep_ep_xpu.utils import init_xpu_distributed, calc_diff, hash_tensor, per_token_cast_to_fp8, per_token_cast_back

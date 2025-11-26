@@ -1,0 +1,27 @@
+[build-system]
+requires = [
+    "setuptools>=64",
+    "wheel",
+    "torch>=2.0.0",
+    "pybind11>=2.10.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep_ep_xpu"
+version = "0.1.0"
+description = "Intel XPU Low Latency MoE Communication Library"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["deep_ep_xpu*"]
