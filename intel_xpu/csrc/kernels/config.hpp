@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <sycl/sycl.hpp>
 
 namespace deep_ep_xpu {
@@ -21,15 +22,27 @@ constexpr int BUFFER_ALIGNMENT = 128;
 // FP8 configuration
 constexpr int FP8_SCALE_BLOCK_SIZE = 128;
 
-// Low latency buffer layout
+// Low latency buffer layout - matching CUDA version structure
 struct LowLatencyBuffer {
-    void* send_x = nullptr;           // Send buffer for hidden states
-    void* send_x_scales = nullptr;    // Send buffer for FP8 scales
-    void* recv_x = nullptr;           // Receive buffer for hidden states
-    void* recv_x_scales = nullptr;    // Receive buffer for FP8 scales
-    int* recv_count = nullptr;        // Receive count buffer
-    int* send_flag = nullptr;         // Send completion flag
-    int* recv_flag = nullptr;         // Receive completion flag
+    int num_clean_int = 0;
+
+    // Dispatch buffers
+    void* dispatch_rdma_send_buffer = nullptr;
+    void* dispatch_rdma_recv_data_buffer = nullptr;
+    int* dispatch_rdma_recv_count_buffer = nullptr;
+
+    // Combine buffers
+    void* combine_rdma_send_buffer = nullptr;
+    void* combine_rdma_recv_data_buffer = nullptr;
+    int* combine_rdma_recv_flag_buffer = nullptr;
+
+    void* combine_rdma_send_buffer_data_start = nullptr;
+    size_t num_bytes_per_combine_msg = 0;
+
+    std::pair<int*, int> clean_meta() {
+        // dispatch_rdma_recv_count_buffer and combine_rdma_recv_flag_buffer share the same memory
+        return {dispatch_rdma_recv_count_buffer, num_clean_int};
+    }
 };
 
 struct LowLatencyLayout {
@@ -41,46 +54,73 @@ struct LowLatencyLayout {
         return reinterpret_cast<out_ptr_t>(reinterpret_cast<count_ptr_t>(ptr) + count);
     }
 
-    LowLatencyLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, 
+    LowLatencyLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank,
                      int hidden, int num_ranks, int num_experts) {
         const int num_scales = hidden / FP8_SCALE_BLOCK_SIZE;
         const int num_local_experts = num_experts / num_ranks;
 
-        // Calculate buffer sizes
-        size_t send_x_size = num_max_dispatch_tokens_per_rank * hidden * sizeof(uint8_t);  // FP8
-        size_t send_scales_size = num_max_dispatch_tokens_per_rank * num_scales * sizeof(float);
-        size_t recv_x_size = num_max_dispatch_tokens_per_rank * num_local_experts * hidden * sizeof(uint8_t);
-        size_t recv_scales_size = num_max_dispatch_tokens_per_rank * num_local_experts * num_scales * sizeof(float);
-        size_t recv_count_size = num_local_experts * sizeof(int);
-        size_t flag_size = sizeof(int);
+        // Dispatch and combine layout (matching CUDA version):
+        //  - 2 symmetric odd/even send buffer
+        //  - 2 symmetric odd/even receive buffers
+        //  - 2 symmetric odd/even signaling buffers
+
+        // Dispatch send buffer: [num_max_dispatch_tokens_per_rank, hidden] FP8 + scales
+        size_t dispatch_send_x_size = num_max_dispatch_tokens_per_rank * hidden * sizeof(uint8_t);
+        size_t dispatch_send_scales_size = num_max_dispatch_tokens_per_rank * num_scales * sizeof(float);
+        size_t dispatch_send_size = dispatch_send_x_size + dispatch_send_scales_size;
+
+        // Dispatch recv buffer: [num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden] FP8
+        size_t dispatch_recv_x_size = num_local_experts * num_ranks * num_max_dispatch_tokens_per_rank * hidden * sizeof(uint8_t);
+
+        // Dispatch recv count: [num_local_experts] int
+        size_t dispatch_recv_count_size = num_local_experts * sizeof(int);
+
+        // Combine send buffer: [num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden] BF16 + flag
+        size_t combine_send_x_size = num_local_experts * num_ranks * num_max_dispatch_tokens_per_rank * hidden * sizeof(uint16_t);
+        size_t combine_send_flag_size = num_local_experts * num_ranks * num_max_dispatch_tokens_per_rank * sizeof(int);
+        size_t combine_send_size = combine_send_x_size + combine_send_flag_size;
+        size_t num_bytes_per_combine_msg = hidden * sizeof(uint16_t) + sizeof(int);
+
+        // Combine recv buffer: [num_max_dispatch_tokens_per_rank, hidden] BF16
+        size_t combine_recv_x_size = num_max_dispatch_tokens_per_rank * hidden * sizeof(uint16_t);
+
+        // Combine recv flag: [num_max_dispatch_tokens_per_rank * num_topk] int (use max topk = 16)
+        size_t combine_recv_flag_size = num_max_dispatch_tokens_per_rank * 16 * sizeof(int);
 
         // Align sizes
         auto align = [](size_t size) { return (size + BUFFER_ALIGNMENT - 1) / BUFFER_ALIGNMENT * BUFFER_ALIGNMENT; };
 
-        send_x_size = align(send_x_size);
-        send_scales_size = align(send_scales_size);
-        recv_x_size = align(recv_x_size);
-        recv_scales_size = align(recv_scales_size);
-        recv_count_size = align(recv_count_size);
-        flag_size = align(flag_size);
+        dispatch_send_size = align(dispatch_send_size);
+        dispatch_recv_x_size = align(dispatch_recv_x_size);
+        dispatch_recv_count_size = align(dispatch_recv_count_size);
+        combine_send_size = align(combine_send_size);
+        combine_recv_x_size = align(combine_recv_x_size);
+        combine_recv_flag_size = align(combine_recv_flag_size);
 
-        // Layout for each buffer (double buffering)
-        size_t buffer_size = send_x_size + send_scales_size + recv_x_size + 
-                            recv_scales_size + recv_count_size + 2 * flag_size;
-        
+        // Total size per buffer
+        size_t buffer_size = dispatch_send_size + dispatch_recv_x_size + dispatch_recv_count_size +
+                            combine_send_size + combine_recv_x_size + combine_recv_flag_size;
+
         total_bytes = 2 * buffer_size;
 
         // Setup buffer pointers
         for (int i = 0; i < 2; i++) {
-            void* base = advance<void*>(rdma_buffer, i * buffer_size);
-            
-            buffers[i].send_x = base;
-            buffers[i].send_x_scales = advance<void*>(base, send_x_size);
-            buffers[i].recv_x = advance<void*>(buffers[i].send_x_scales, send_scales_size);
-            buffers[i].recv_x_scales = advance<void*>(buffers[i].recv_x, recv_x_size);
-            buffers[i].recv_count = advance<int*>(buffers[i].recv_x_scales, recv_scales_size);
-            buffers[i].send_flag = advance<int*>(buffers[i].recv_count, recv_count_size);
-            buffers[i].recv_flag = advance<int*>(buffers[i].send_flag, flag_size);
+            void* base = rdma_buffer ? advance<void*>(rdma_buffer, i * buffer_size) : nullptr;
+
+            // Dispatch buffers
+            buffers[i].dispatch_rdma_send_buffer = base;
+            buffers[i].dispatch_rdma_recv_data_buffer = base ? advance<void*>(base, dispatch_send_size) : nullptr;
+            buffers[i].dispatch_rdma_recv_count_buffer = base ? advance<int*>(buffers[i].dispatch_rdma_recv_data_buffer, dispatch_recv_x_size) : nullptr;
+
+            // Combine buffers
+            buffers[i].combine_rdma_send_buffer = base ? advance<void*>(buffers[i].dispatch_rdma_recv_count_buffer, dispatch_recv_count_size) : nullptr;
+            buffers[i].combine_rdma_send_buffer_data_start = buffers[i].combine_rdma_send_buffer;
+            buffers[i].combine_rdma_recv_data_buffer = base ? advance<void*>(buffers[i].combine_rdma_send_buffer, combine_send_size) : nullptr;
+            buffers[i].combine_rdma_recv_flag_buffer = base ? advance<int*>(buffers[i].combine_rdma_recv_data_buffer, combine_recv_x_size) : nullptr;
+
+            // Metadata
+            buffers[i].num_bytes_per_combine_msg = num_bytes_per_combine_msg;
+            buffers[i].num_clean_int = static_cast<int>((dispatch_recv_count_size + combine_recv_flag_size) / sizeof(int));
         }
     }
 };
