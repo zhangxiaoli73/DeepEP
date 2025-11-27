@@ -7,6 +7,9 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <ishmem.h>
+#include <ishmemx.h>
+#include <mpi.h>
 
 #define NUM_MAX_NVL_PEERS 8
 #define NUM_MAX_RDMA_PEERS 20
@@ -80,10 +83,13 @@ Buffer::~Buffer() {
 }
 
 void Buffer::initialize_buffers() {
-    // Allocate main buffer
-    main_buffer_ = sycl::malloc_device(buffer_size_, queue_);
-    if (!main_buffer_) {
-        throw std::runtime_error("Failed to allocate main buffer");
+    // Allocate main buffer (skip if size is 0)
+    if (buffer_size_ > 0) {
+        main_buffer_ = sycl::malloc_device(buffer_size_, queue_);
+        if (!main_buffer_) {
+            throw std::runtime_error("Failed to allocate main buffer");
+        }
+        queue_.memset(main_buffer_, 0, buffer_size_);
     }
     
     // Allocate RDMA buffer
@@ -100,8 +106,7 @@ void Buffer::initialize_buffers() {
         throw std::runtime_error("Failed to allocate workspace");
     }
     
-    // Initialize buffers to zero
-    queue_.memset(main_buffer_, 0, buffer_size_);
+    // Initialize remaining buffers to zero
     if (rdma_buffer_) {
         queue_.memset(rdma_buffer_, 0, rdma_buffer_size_);
     }
@@ -112,7 +117,6 @@ void Buffer::initialize_buffers() {
 void Buffer::initialize_communication() {
     ishmem_init();
     ishmem_barrier_all();
-}
 }
 
 void Buffer::cleanup() {
