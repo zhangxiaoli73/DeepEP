@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <ishmem.h>
 #include <ishmemx.h>
-#include <mpi.h>
+// #include <mpi.h>
 
 #define NUM_MAX_NVL_PEERS 8
 #define NUM_MAX_RDMA_PEERS 20
