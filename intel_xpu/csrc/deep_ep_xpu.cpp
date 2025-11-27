@@ -110,12 +110,9 @@ void Buffer::initialize_buffers() {
 }
 
 void Buffer::initialize_communication() {
-    // Initialize communication infrastructure
-    // In production, this would set up:
-    // - Intel MPI or CCL for multi-device/multi-node communication
-    // - Shared memory for intra-node communication
-    // - RDMA for inter-node communication
-    std::cout << "Initializing low latency communication..." << std::endl;
+    ishmem_init();
+    ishmem_barrier_all();
+}
 }
 
 void Buffer::cleanup() {
@@ -130,6 +127,10 @@ void Buffer::cleanup() {
     if (workspace_) {
         sycl::free(workspace_, queue_);
         workspace_ = nullptr;
+    }
+    if (low_latency_mode_) {
+        std::cout << "Finalizing ISHMEM..." << std::endl;
+        ishmem_finalize();
     }
     destroyed_ = true;
 }
