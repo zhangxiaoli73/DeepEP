@@ -7,19 +7,31 @@ import torch.distributed as dist
 import os
 
 
-def init_dist(local_rank: int, num_local_ranks: int, backend: str = 'xccl'):
-    # NOTES: you may rewrite this function with your own cluster settings
+def init_dist(local_rank: int, num_local_ranks: int = None, backend: str = 'xccl'):
+    # NOTES: MPI-based initialization for ISHMEM support
+    # Get MPI rank and size from environment variables set by mpiexec
+    rank_env = int(os.getenv('OMPI_COMM_WORLD_RANK', 
+                            os.getenv('MPI_LOCALRANKID',
+                                     os.getenv('PMI_RANK', '0'))))
+    size_env = int(os.getenv('OMPI_COMM_WORLD_SIZE',
+                            os.getenv('MPI_LOCALNRANKS',
+                                     os.getenv('PMI_SIZE', '1'))))
+    
+    # If num_local_ranks not provided, use environment value
+    if num_local_ranks is None:
+        num_local_ranks = size_env
+    
     ip = os.getenv('MASTER_ADDR', '127.0.0.1')
     port = int(os.getenv('MASTER_PORT', '8361'))
-    num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    node_rank = int(os.getenv('RANK', 0))
+    num_nodes = int(os.getenv('WORLD_SIZE', size_env))
+    node_rank = int(os.getenv('RANK', rank_env))
 
     sig = inspect.signature(dist.init_process_group)
     params = {
         'backend': 'xccl',
         'init_method': f'tcp://{ip}:{port}',
-        'world_size': num_nodes * num_local_ranks,
-        'rank': node_rank * num_local_ranks + local_rank,
+        'world_size': num_local_ranks,
+        'rank': rank_env,
     }
     if 'device_id' in sig.parameters:
         # noinspection PyTypeChecker
@@ -29,7 +41,7 @@ def init_dist(local_rank: int, num_local_ranks: int, backend: str = 'xccl'):
     torch.set_default_device('xpu')
     torch.xpu.set_device(local_rank)
 
-    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
+    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks)))
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:

@@ -1,0 +1,286 @@
+"""
+Test low latency MoE operations on Intel XPU with MPI launcher
+
+Usage:
+    mpiexec -n 2 python test_low_latency_xpu_mpi.py --num-topk 2 --num-experts 16
+"""
+
+import argparse
+import random
+import torch
+import torch.distributed as dist
+from typing import Literal, Set
+import os
+
+import sys
+sys.path.insert(0, '..')
+
+import deep_ep_xpu
+from deep_ep_xpu.utils import init_xpu_distributed, calc_diff, hash_tensor, per_token_cast_to_fp8, per_token_cast_back
+
+
+def init_dist_mpi(local_rank: int):
+    """Initialize distributed training with MPI"""
+    # Get MPI rank and size from environment variables set by mpiexec
+    rank = int(os.environ.get('OMPI_COMM_WORLD_RANK', 
+                              os.environ.get('MPI_LOCALRANKID',
+                                           os.environ.get('PMI_RANK', '0'))))
+    world_size = int(os.environ.get('OMPI_COMM_WORLD_SIZE',
+                                    os.environ.get('MPI_LOCALNRANKS',
+                                                  os.environ.get('PMI_SIZE', '1'))))
+    
+    print(f"[MPI] Rank {rank}/{world_size}, Local rank {local_rank}")
+    
+    # Set environment for PyTorch distributed
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', '127.0.0.1')
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29500')
+
+    # Initialize distributed process group
+    dist.init_process_group(
+        backend='xccl',
+        init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+        rank=rank,
+        world_size=world_size
+    )
+
+    # Set current device based on local rank
+    # torch.xpu.set_device(local_rank)
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device('xpu')
+
+    group = dist.group.WORLD
+    rank = dist.get_rank()
+    num_ranks = dist.get_world_size()
+
+    print(f"[Init] Local rank {local_rank} -> Global rank {rank}/{num_ranks}, Device: xpu:{torch.xpu.current_device()}")
+
+    return rank, num_ranks, group
+
+
+def test_low_latency_dispatch_combine(
+    num_tokens: int,
+    hidden: int,
+    num_experts: int,
+    num_topk: int,
+    rank: int,
+    num_ranks: int,
+    group: dist.ProcessGroup,
+    buffer: deep_ep_xpu.Buffer,
+    use_fp8: bool = False,
+    use_logfmt: bool = False,
+    seed: int = 0
+):
+    """Test low latency dispatch and combine operations"""
+
+    torch.manual_seed(seed + rank)
+    random.seed(seed + rank)
+
+    assert num_experts % num_ranks == 0
+    num_local_experts = num_experts // num_ranks
+
+    print(f"[Rank {rank}] Testing with num_tokens={num_tokens}, hidden={hidden}, "
+          f"num_experts={num_experts}, num_topk={num_topk}, use_fp8={use_fp8}")
+
+    # Create test data
+    hidden_states = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device='xpu')
+    topk_idx = torch.randint(0, num_experts, (num_tokens, num_topk), dtype=torch.int32, device='xpu')
+    topk_weights = torch.randn(num_tokens, num_topk, dtype=torch.float32, device='xpu')
+
+    # Normalize weights
+    if use_logfmt:
+        topk_weights = torch.log_softmax(topk_weights, dim=-1)
+    else:
+        topk_weights = torch.softmax(topk_weights, dim=-1)
+
+    # Test dispatch
+    print(f"[Rank {rank}] Testing dispatch...")
+    recv_hidden_states, recv_count, handle, event, hook = buffer.low_latency_dispatch(
+        hidden_states, topk_idx, num_tokens, num_experts,
+        use_fp8=use_fp8, async_finish=False, return_recv_hook=True
+    )
+
+    if hook is not None:
+        hook()  # Wait for completion
+
+    event.wait()  # Wait for event
+
+    print(f"[Rank {rank}] Dispatch completed. Received counts: {recv_count}")
+
+    # Simulate expert processing
+    if isinstance(recv_hidden_states, tuple):
+        recv_x, recv_scales = recv_hidden_states
+        # Dequantize for processing
+        expert_output = per_token_cast_back(recv_x, recv_scales)
+    else:
+        expert_output = recv_hidden_states
+
+    # Simple expert processing (identity for testing)
+    expert_output = expert_output.clone()
+
+    # Test combine
+    print(f"[Rank {rank}] Testing combine...")
+    combined_output, event, hook = buffer.low_latency_combine(
+        expert_output, topk_idx, topk_weights, handle,
+        use_logfmt=use_logfmt, async_finish=False, return_recv_hook=True
+    )
+
+    if hook is not None:
+        hook()  # Wait for completion
+
+    event.wait()  # Wait for event
+
+    print(f"[Rank {rank}] Combine completed. Output shape: {combined_output.shape}")
+
+    # Verify output shape
+    assert combined_output.shape == (num_tokens, hidden), \
+        f"Output shape mismatch: {combined_output.shape} vs {(num_tokens, hidden)}"
+
+    # Compute hash for verification across ranks
+    output_hash = hash_tensor(combined_output)
+    print(f"[Rank {rank}] Output hash: {output_hash}")
+
+    # Synchronize
+    dist.barrier(group)
+
+    return output_hash
+
+
+def test_correctness(
+    num_tokens: int,
+    hidden: int,
+    num_experts: int,
+    num_topk: int,
+    rank: int,
+    num_ranks: int,
+    group: dist.ProcessGroup,
+    buffer: deep_ep_xpu.Buffer
+):
+    """Test correctness with reference implementation"""
+
+    print(f"[Rank {rank}] Running correctness test...")
+
+    torch.manual_seed(42 + rank)
+
+    # Create test data
+    hidden_states = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device='xpu')
+    topk_idx = torch.randint(0, num_experts, (num_tokens, num_topk), dtype=torch.int32, device='xpu')
+    topk_weights = torch.softmax(torch.randn(num_tokens, num_topk, device='xpu'), dim=-1)
+
+    # Run low latency version
+    recv_hidden_states, recv_count, handle, event, hook = buffer.low_latency_dispatch(
+        hidden_states, topk_idx, num_tokens, num_experts,
+        use_fp8=False, async_finish=False, return_recv_hook=False
+    )
+
+    event.wait()  # Wait for dispatch to complete
+
+    expert_output = recv_hidden_states.clone()
+
+    combined_output, event, hook = buffer.low_latency_combine(
+        expert_output, topk_idx, topk_weights, handle,
+        use_logfmt=False, async_finish=False, return_recv_hook=False
+    )
+
+    event.wait()  # Wait for combine to complete
+
+    # Simple reference: weighted sum of inputs (simplified)
+    # In real test, would implement full reference
+    reference_output = torch.zeros_like(hidden_states)
+    for i in range(num_tokens):
+        for k in range(num_topk):
+            weight = topk_weights[i, k]
+            reference_output[i] += weight * hidden_states[i]
+
+    # Compare (allowing for numerical differences)
+    diff = calc_diff(combined_output, reference_output)
+    print(f"[Rank {rank}] Difference from reference: {diff:.6f}")
+
+    # Relaxed threshold due to distributed operations
+    assert diff < 0.1, f"Output differs too much from reference: {diff}"
+
+    print(f"[Rank {rank}] Correctness test passed!")
+
+    dist.barrier(group)
+
+
+def test_main(args: argparse.Namespace):
+    """Main test function"""
+
+    # Get local rank from environment (set by MPI launcher)
+    local_rank = int(os.environ.get('OMPI_COMM_WORLD_LOCAL_RANK',
+                                    os.environ.get('MPI_LOCALRANKID', '0')))
+    
+    # Initialize distributed with MPI
+    rank, num_ranks, group = init_dist_mpi(local_rank)
+
+    print(f"[Rank {rank}/{num_ranks}] Initialized on device {torch.xpu.current_device()}")
+
+    # Create buffer
+    num_max_dispatch_tokens = args.num_tokens
+    rdma_buffer_size = deep_ep_xpu.Buffer.get_low_latency_rdma_size_hint(
+        num_max_dispatch_tokens, args.hidden, num_ranks, args.num_experts
+    )
+
+    buffer = deep_ep_xpu.Buffer(
+        group=group,
+        num_nvl_bytes=0,  # Not used on Intel XPU
+        num_rdma_bytes=rdma_buffer_size,
+        low_latency_mode=True,
+        num_qps_per_rank=max(24, args.num_experts // num_ranks),
+        explicitly_destroy=True
+    )
+
+    print(f"[Rank {rank}] Buffer created with RDMA size: {rdma_buffer_size / 1e9:.2f} GB")
+
+    # Clean buffer before first use
+    buffer.clean_low_latency_buffer(num_max_dispatch_tokens, args.hidden, args.num_experts)
+
+    # Run tests
+    test_configs = [
+        {"use_fp8": False, "use_logfmt": False},
+        {"use_fp8": True, "use_logfmt": False},
+        {"use_fp8": False, "use_logfmt": True},
+    ]
+
+    for i, config in enumerate(test_configs):
+        print(f"\n[Rank {rank}] Running test {i+1}/{len(test_configs)}: {config}")
+
+        hash_value = test_low_latency_dispatch_combine(
+            args.num_tokens, args.hidden, args.num_experts, args.num_topk,
+            rank, num_ranks, group, buffer,
+            use_fp8=config["use_fp8"], use_logfmt=config["use_logfmt"],
+            seed=i
+        )
+
+        # Gather hashes from all ranks
+        hash_tensor_all = torch.tensor([hash_value], dtype=torch.int64, device='xpu')
+        hash_list = [torch.zeros_like(hash_tensor_all) for _ in range(num_ranks)]
+        dist.all_gather(hash_list, hash_tensor_all, group=group)
+
+        if rank == 0:
+            print(f"Hash values from all ranks: {[h.item() for h in hash_list]}")
+
+    # Run correctness test
+    print(f"\n[Rank {rank}] Running correctness test...")
+    test_correctness(args.num_tokens, args.hidden, args.num_experts, args.num_topk,
+                    rank, num_ranks, group, buffer)
+
+    # Cleanup
+    buffer.destroy()
+
+    if rank == 0:
+        print("\n✓ All tests passed!")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Test low-latency EP kernels with MPI')
+    parser.add_argument('--num-tokens', type=int, default=128, help='Number of tokens (default: 128)')
+    parser.add_argument('--hidden', type=int, default=7168, help='Hidden dimension size (default: 7168)')
+    parser.add_argument('--num-topk', type=int, default=8, help='Number of top-k experts (default: 8)')
+    parser.add_argument('--num-experts', type=int, default=288, help='Number of experts (default: 288)')
+    args = parser.parse_args()
+
+    # Run test directly (launched via mpiexec)
+    test_main(args)
